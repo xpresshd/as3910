@@ -1,0 +1,12 @@
+[package]
+name = "as3910"
+version = "0.1.0"
+authors = ["Reinis Muiznieks <muiznieks.reinis@gmail.com>"]
+edition = "2021"
+description = "A platform agnostic driver to interface the AS3910 (RFID reader/writer)"
+license = "MIT OR Apache-2.0"
+keywords = ["rfid", "as3910", "embedded-hal"]
+categories = ["embedded", "hardware-support", "no-std"]
+
+[dependencies]
+embedded-hal = "1.0.0-alpha.8"
