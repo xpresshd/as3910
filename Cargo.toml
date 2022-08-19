@@ -9,10 +9,5 @@ keywords = ["rfid", "as3910", "embedded-hal"]
 categories = ["embedded", "hardware-support", "no-std"]
 
 [dependencies]
-embedded-hal = { package = "embedded-hal", version = "1.0.0-alpha.8", optional = true }
-embedded_hal_2_7 = { package = "embedded-hal", version = "0.2.7", optional = true }
+embedded-hal = { package = "embedded-hal", version = "0.2.7" }
 
-[features]
-default = ["hal_0_2"]
-hal_0_2 = ["embedded_hal_2_7"]
-hal_1_0 = ["embedded-hal"]
