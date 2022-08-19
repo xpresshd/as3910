@@ -1,7 +1,7 @@
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
-enum Command {
+pub enum Command {
     /// Puts the AS3910 in default state (same as after power-up)
     SetDefault = 0b000001,
     /// Stops all activities and clears FIFO
@@ -49,5 +49,13 @@ impl From<Command> for u8 {
     #[inline(always)]
     fn from(variant: Command) -> Self {
         variant as _
+    }
+}
+
+const C: u8 = (1 << 7) + (1 << 6);
+
+impl Command {
+    pub fn command_pattern(&self) -> u8 {
+        (*self as u8) | C
     }
 }

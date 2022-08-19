@@ -42,15 +42,15 @@ impl From<Register> for u8 {
     }
 }
 
-const R: u8 = 1 << 7;
-const W: u8 = 0 << 7;
+const R: u8 = 1 << 6;
+const W: u8 = 0 << 6;
 
 impl Register {
-    fn read_address(&self) -> u8 {
-        ((*self as u8) << 1) | R
+    pub fn read_address(&self) -> u8 {
+        (*self as u8) | R
     }
 
-    fn write_address(&self) -> u8 {
-        ((*self as u8) << 1) | W
+    pub fn write_address(&self) -> u8 {
+        (*self as u8) | W
     }
 }
