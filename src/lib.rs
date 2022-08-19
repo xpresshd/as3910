@@ -104,8 +104,27 @@ where
         self.execute_command(Command::SetDefault)
     }
 
+    /// Sends a REQuest type A to nearby PICCs
+    pub fn reqa(&mut self) -> Result<Option<AtqA>, Error<E, OPE>> {
+        self.execute_command(Command::TransmitREQA)?;
+
+        self.wait_for_interrupt(50)?;
+
+        let fifo_reg = self.read_register(Register::FIFOStatus)?;
+
+        if fifo_reg >> 2 == 0b00111111 {
+            // No PICC in area
+            return Ok(None);
+        }
+        let mut buffer = [0u8; 2];
+
+        self.read_fifo(&mut buffer)?;
+
+        Ok(Some(AtqA { bytes: buffer }))
+    }
+
     /// Sends a Wake UP type A to nearby PICCs
-    pub fn wupa<'b>(&mut self) -> Result<Option<AtqA>, Error<E, OPE>> {
+    pub fn wupa(&mut self) -> Result<Option<AtqA>, Error<E, OPE>> {
         self.execute_command(Command::TransmitWUPA)?;
 
         self.wait_for_interrupt(50)?;
@@ -121,16 +140,14 @@ where
         self.read_fifo(&mut buffer)?;
 
         Ok(Some(AtqA { bytes: buffer }))
+    }
 
-        // NOTE WUPA is a short frame (7 bits)
-        // let fifo_data = self.transceive(&[picc::Command::WUPA as u8], 7, 0)?;
-        // if fifo_data.valid_bytes != 2 || fifo_data.valid_bits != 0 {
-        //     Err(Error::IncompleteFrame)
-        // } else {
-        //     Ok(AtqA {
-        //         bytes: fifo_data.buffer,
-        //     })
-        // }
+    pub fn execute_command(&mut self, command: Command) -> Result<(), Error<E, OPE>> {
+        self.write(&[command.command_pattern()])
+    }
+
+    pub fn write_register(&mut self, reg: Register, val: u8) -> Result<(), Error<E, OPE>> {
+        self.write(&[reg.write_address(), val])
     }
 
     pub fn read_register(&mut self, reg: Register) -> Result<u8, Error<E, OPE>> {
@@ -189,14 +206,6 @@ where
         }
 
         Err(Error::InterruptTimeout)
-    }
-
-    fn execute_command(&mut self, command: Command) -> Result<(), Error<E, OPE>> {
-        self.write(&[command.command_pattern()])
-    }
-
-    fn write_register(&mut self, reg: Register, val: u8) -> Result<(), Error<E, OPE>> {
-        self.write(&[reg.write_address(), val])
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<(), Error<E, OPE>> {
