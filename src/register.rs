@@ -54,3 +54,18 @@ impl Register {
         (*self as u8) | W
     }
 }
+
+bitflags! {
+    pub struct InterruptFlags: u8 {
+        const BIT_COLLISION = 0b0000_0001;
+        const CRC_ERROR = 0b0000_0010;
+        const RECEIVE_DATA_CODING_ERROR = 0b000_0100;
+        const END_OF_TRANSMISSION = 0b000_1000;
+        const END_OF_RECEIVE = 0b0001_0000;
+        const FIFO_WATER_LEVEL = 0b0010_0000;
+        const NFC_EVENT = 0b0100_0000;
+        const OSCILLATOR_FREQUENCY_STABLE = 0b1000_0000;
+
+        const ALL = 0b1111_1111;
+    }
+}

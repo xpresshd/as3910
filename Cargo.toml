@@ -9,5 +9,6 @@ keywords = ["rfid", "as3910", "embedded-hal"]
 categories = ["embedded", "hardware-support", "no-std"]
 
 [dependencies]
+bitflags = "1.3.2"
 embedded-hal = { package = "embedded-hal", version = "0.2.7", features = ["unproven"]}
 
