@@ -22,6 +22,7 @@ pub struct AtqA {
     pub bytes: [u8; 2],
 }
 
+#[derive(Hash, Eq, PartialEq)]
 pub enum Uid {
     /// Single sized UID, 4 bytes long
     Single(GenericUid<4>),
@@ -41,6 +42,7 @@ impl Uid {
     }
 }
 
+#[derive(Hash, Eq, PartialEq)]
 pub struct GenericUid<const T: usize>
 where
     [u8; T]: Sized,
@@ -76,6 +78,9 @@ impl<const L: usize> FifoData<L> {
     /// Assumes the FIFO data is aligned properly to append directly to the current known bits.
     /// Returns the number of valid bits in the destination buffer after copy.
     pub fn copy_bits_to(&self, dst: &mut [u8], dst_valid_bits: u8) -> u8 {
+        if self.valid_bytes == 0 {
+            return dst_valid_bits;
+        }
         let dst_valid_bytes = dst_valid_bits / 8;
         let dst_valid_last_bits = dst_valid_bits % 8;
         let mask: u8 = 0xFF << dst_valid_last_bits;
@@ -209,23 +214,30 @@ where
                 let end = tx_bytes as usize + if tx_last_bits > 0 { 1 } else { 0 };
                 tx[1] = (tx_bytes << 4) + tx_last_bits;
 
+                println!("tx_last_bits {tx_last_bits}");
+                println!("tx_bytes {tx_bytes}");
+                println!("end {end}");
+                println!("tx[1] {}", tx[1]);
+
                 // Tell transceive the only send `tx_last_bits` of the last byte
                 // and also to put the first received bit at location `tx_last_bits`.
                 // This makes it easier to append the received bits to the uid (in `tx`).
-                match self.communicate_to_picc::<5>(&tx[0..end], tx_last_bits, true,false) {
+                match self.communicate_to_picc::<5>(&tx[0..end], tx_last_bits, true, false) {
                     Ok(fifo_data) => {
                         fifo_data.copy_bits_to(&mut tx[2..=6], known_bits);
                         println!("fifo_data {:?}", fifo_data);
                         break 'anticollision;
                     }
                     Err(Error::Collision) => {
-                        println!("Collsision");
                         let coll_reg = self.read_register(Register::Collision)?;
 
-                        let bytes_before_coll = (coll_reg >> 4) & 0b1111;    
+                        let bytes_before_coll = ((coll_reg >> 4) & 0b1111) - 2;
                         let bits_before_coll = (coll_reg >> 1) & 0b111;
 
-                        let coll_pos = bytes_before_coll * 8 + bits_before_coll + 1; 
+                        let coll_pos = bytes_before_coll * 8 + bits_before_coll + 1;
+                        println!("bytes_before_coll {bytes_before_coll}");
+                        println!("bits_before_coll {bits_before_coll}");
+                        println!("coll_pos {coll_pos}");
 
                         if coll_pos < known_bits {
                             // No progress
@@ -233,10 +245,10 @@ where
                         }
 
                         let fifo_data = self.fifo_data::<5>()?;
+                        println!("colission {:?}", fifo_data);
 
                         fifo_data.copy_bits_to(&mut tx[2..=6], known_bits);
                         known_bits = coll_pos;
-
 
                         // Set the bit of collision position to 1
                         let count = known_bits % 8;
@@ -253,12 +265,11 @@ where
             tx[1] = 0x70; // NVB: 7 valid bytes
             tx[6] = tx[2] ^ tx[3] ^ tx[4] ^ tx[5]; // BCC
 
-
             // TODO check if we send correct based on with crc
 
             let rx = self.communicate_to_picc::<1>(&tx[0..7], 0, false, true)?;
             println!("rx {:?}", rx);
-            
+
             let sak = picc::Sak::from(rx.buffer[0]);
 
             if !sak.is_complete() {
@@ -269,7 +280,6 @@ where
                 uid_bytes[uid_idx..uid_idx + 4].copy_from_slice(&tx[2..6]);
                 break 'cascade sak;
             }
-
         };
 
         match cascade_level {
@@ -287,7 +297,6 @@ where
             })),
             _ => unreachable!(),
         }
-
     }
 
     /// Sends a Wake UP type A to nearby PICCs
@@ -300,6 +309,7 @@ where
         with_anti_collision: bool,
         with_crc: bool,
     ) -> Result<FifoData<RX>, Error<E, OPE>> {
+        println!("Communicate to picc {:x?}", tx_buffer);
         self.setup_interrupt_mask(InterruptFlags::END_OF_RECEIVE)?;
 
         self.execute_command(Command::Clear)?;
@@ -314,6 +324,9 @@ where
         let flags = (full_bytes_num << 6)
             + (((tx_last_bits & 0x7) << 3) as usize)
             + (with_anti_collision as usize);
+
+        println!("full_bytes_num {full_bytes_num}");
+        println!("flags {flags}");
 
         self.write_register(Register::NumberOfTransmittedBytes0, flags as u8)?;
         self.write_register(
@@ -339,6 +352,8 @@ where
         }
 
         let intr = self.wait_for_interrupt(250)?;
+
+        println!("intr {:?}", intr);
 
         if intr.contains(InterruptFlags::BIT_COLLISION) {
             return Err(Error::Collision);
@@ -367,14 +382,15 @@ where
 
         if RX > 0 {
             let fifo_status = self.read_register(Register::FIFOStatus)?;
-    
+            println!("fifo_status {}", fifo_status);
+
             valid_bytes = (fifo_status >> 2) as usize;
             if valid_bytes > RX {
                 return Err(Error::NoRoom);
             }
             if valid_bytes > 0 {
                 self.read_fifo(&mut buffer[0..valid_bytes])?;
-                
+
                 // TODO: check
                 //valid_bits = (self.read(Register::ControlReg).map_err(Error::Spi)? & 0x07) as usize;
             }
@@ -386,7 +402,6 @@ where
             valid_bits,
         })
     }
-
 
     pub fn setup_interrupt_mask(&mut self, flags: InterruptFlags) -> Result<u8, Error<E, OPE>> {
         // Need to invert bits
@@ -459,7 +474,9 @@ where
         let mut i = 0;
         loop {
             if self.intr.is_high().map_err(Error::InterruptPin)? {
-                return Ok(InterruptFlags::from_bits_truncate(self.read_register(Register::Interrupt)?));
+                return Ok(InterruptFlags::from_bits_truncate(
+                    self.read_register(Register::Interrupt)?,
+                ));
             }
 
             if i >= timeout_in_ms {

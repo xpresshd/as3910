@@ -84,6 +84,7 @@ pub enum Type {
 }
 
 /// Select Acknowledge
+#[derive(Hash, Eq, PartialEq)]
 pub struct Sak {
     byte: u8,
 }
