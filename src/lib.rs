@@ -3,6 +3,8 @@
 #[macro_use]
 extern crate bitflags;
 
+extern crate alloc;
+
 use command::Command;
 use embedded_hal as hal;
 use hal::blocking::delay;
@@ -10,10 +12,13 @@ use hal::blocking::spi;
 use hal::digital::v2::InputPin;
 use hal::digital::v2::OutputPin;
 use register::InterruptFlags;
+use spi_manager::SpiManager;
+use spi_manager::WithHighError;
 
 pub mod command;
 mod picc;
 pub mod register;
+pub mod spi_manager;
 
 use crate::register::Register;
 
@@ -95,24 +100,25 @@ impl<const L: usize> FifoData<L> {
     }
 }
 
-pub struct AS3910<SPI, CS, INTR, DELAY> {
-    spi: SPI,
+pub struct AS3910<SPIM, CS, INTR, DELAY> {
+    spi_manager: SPIM,
     cs: CS,
     /// Interrupt pin
     intr: INTR,
     delay: DELAY,
 }
 
-impl<E, OPE, CS, INTR, SPI, DELAY> AS3910<SPI, CS, INTR, DELAY>
+impl<OPE, CS, INTR, SPIM, DELAY> AS3910<SPIM, CS, INTR, DELAY>
 where
-    SPI: spi::Transfer<u8, Error = E> + spi::Write<u8, Error = E>,
+    SPIM: SpiManager,
     CS: OutputPin<Error = OPE>,
     INTR: InputPin<Error = OPE>,
     DELAY: delay::DelayMs<u16>,
 {
-    pub fn new(spi: SPI, cs: CS, intr: INTR, delay: DELAY) -> Result<Self, Error<E, OPE>> {
+
+    pub fn new(spi_manager: SPIM, cs: CS, intr: INTR, delay: DELAY) -> Result<Self, Error<SPIM::SpiError, OPE>> {
         let mut as3910 = Self {
-            spi,
+            spi_manager,
             cs,
             intr,
             delay,
@@ -129,8 +135,13 @@ where
         if val & 0x8 != 0 {
             return Err(Error::AntennaCalibration);
         }
-        // TODO: investigate and write comment
+        // Enables oscillator and regulator
+        // Enables receiver operation
+        // Enables RF output
         as3910.write_register(Register::OperationControl, 0xD0)?;
+
+        // PM demodulation
+        // as3910.write_register(Register::ConfigurationRegister5, 0b1000_0000)?;
         as3910.execute_command(Command::Clear)?;
 
         as3910.setup_interrupt_mask(InterruptFlags::END_OF_RECEIVE)?;
@@ -138,16 +149,18 @@ where
         Ok(as3910)
     }
 
-    pub fn reset(&mut self) -> Result<(), Error<E, OPE>> {
+    pub fn reset(&mut self) -> Result<(), Error<SPIM::SpiError, OPE>> {
         self.execute_command(Command::SetDefault)
     }
 
     /// Sends a REQuest type A to nearby PICCs
-    pub fn reqa(&mut self) -> Result<Option<AtqA>, Error<E, OPE>> {
+    pub fn reqa(&mut self) -> Result<Option<AtqA>, Error<SPIM::SpiError, OPE>> {
+        self.execute_command(Command::Clear)?;
+        self.write_register(Register::ConfigurationRegister3, 0x80)?;
         self.setup_interrupt_mask(InterruptFlags::END_OF_RECEIVE)?;
         self.execute_command(Command::TransmitREQA)?;
 
-        self.wait_for_interrupt(50)?;
+        self.wait_for_interrupt(5)?;
 
         let fifo_reg = self.read_register(Register::FIFOStatus)?;
 
@@ -163,11 +176,11 @@ where
     }
 
     /// Sends a Wake UP type A to nearby PICCs
-    pub fn wupa(&mut self) -> Result<Option<AtqA>, Error<E, OPE>> {
+    pub fn wupa(&mut self) -> Result<Option<AtqA>, Error<SPIM::SpiError, OPE>> {
         self.setup_interrupt_mask(InterruptFlags::END_OF_RECEIVE)?;
         self.execute_command(Command::TransmitWUPA)?;
 
-        self.wait_for_interrupt(50)?;
+        self.wait_for_interrupt(5)?;
 
         let fifo_reg = self.read_register(Register::FIFOStatus)?;
 
@@ -182,12 +195,21 @@ where
         Ok(Some(AtqA { bytes: buffer }))
     }
 
-    pub fn select(&mut self, atqa: &AtqA) -> Result<Uid, Error<E, OPE>> {
-        // check for proprietary anticollision
-        // if (atqa.bytes[0] & 0b00011111).count_ones() != 1 {
-        //     return Err(Error::Proprietary);
-        // }
+    /// Sends command to enter HALT state
+    pub fn hlta(&mut self) -> Result<(), Error<SPIM::SpiError, OPE>> {
+        // The standard says:
+        //   If the PICC responds with any modulation during a period of 1 ms
+        //   after the end of the frame containing the HLTA command,
+        //   this response shall be interpreted as 'not acknowledge'.
+        // We interpret that this way: Only Error::Timeout is a success.
+        match self.communicate_to_picc::<0>(&[0x50, 0x00], 0, false, true) {
+            Err(Error::InterruptTimeout) => Ok(()),
+            Ok(_) => Err(Error::NotAcknowledged),
+            Err(e) => Err(e),
+        }
+    }
 
+    pub fn select(&mut self) -> Result<Uid, Error<SPIM::SpiError, OPE>> {
         let mut cascade_level: u8 = 0;
         let mut uid_bytes: [u8; 10] = [0u8; 10];
         let mut uid_idx: usize = 0;
@@ -214,10 +236,10 @@ where
                 let end = tx_bytes as usize + if tx_last_bits > 0 { 1 } else { 0 };
                 tx[1] = (tx_bytes << 4) + tx_last_bits;
 
-                println!("tx_last_bits {tx_last_bits}");
-                println!("tx_bytes {tx_bytes}");
-                println!("end {end}");
-                println!("tx[1] {}", tx[1]);
+                // println!("tx_last_bits {tx_last_bits}");
+                // println!("tx_bytes {tx_bytes}");
+                // println!("end {end}");
+                // println!("tx[1] {}", tx[1]);
 
                 // Tell transceive the only send `tx_last_bits` of the last byte
                 // and also to put the first received bit at location `tx_last_bits`.
@@ -225,7 +247,7 @@ where
                 match self.communicate_to_picc::<5>(&tx[0..end], tx_last_bits, true, false) {
                     Ok(fifo_data) => {
                         fifo_data.copy_bits_to(&mut tx[2..=6], known_bits);
-                        println!("fifo_data {:?}", fifo_data);
+                        // println!("fifo_data {:?}", fifo_data);
                         break 'anticollision;
                     }
                     Err(Error::Collision) => {
@@ -235,17 +257,17 @@ where
                         let bits_before_coll = (coll_reg >> 1) & 0b111;
 
                         let coll_pos = bytes_before_coll * 8 + bits_before_coll + 1;
-                        println!("bytes_before_coll {bytes_before_coll}");
-                        println!("bits_before_coll {bits_before_coll}");
-                        println!("coll_pos {coll_pos}");
+                        // println!("bytes_before_coll {bytes_before_coll}");
+                        // println!("bits_before_coll {bits_before_coll}");
+                        // println!("coll_pos {coll_pos}");
 
-                        if coll_pos < known_bits {
+                        if coll_pos < known_bits || coll_pos > 8 * 9 {
                             // No progress
                             return Err(Error::Collision);
                         }
 
                         let fifo_data = self.fifo_data::<5>()?;
-                        println!("colission {:?}", fifo_data);
+                        // println!("colission {:?}", fifo_data);
 
                         fifo_data.copy_bits_to(&mut tx[2..=6], known_bits);
                         known_bits = coll_pos;
@@ -255,6 +277,7 @@ where
                         let check_bit = (known_bits - 1) % 8;
                         let index: usize =
                             1 + (known_bits / 8) as usize + if count != 0 { 1 } else { 0 };
+                        // TODO safe check that index is in range
                         tx[index] |= 1 << check_bit;
                     }
                     Err(e) => return Err(e),
@@ -268,7 +291,7 @@ where
             // TODO check if we send correct based on with crc
 
             let rx = self.communicate_to_picc::<1>(&tx[0..7], 0, false, true)?;
-            println!("rx {:?}", rx);
+            // println!("rx {:?}", rx);
 
             let sak = picc::Sak::from(rx.buffer[0]);
 
@@ -308,8 +331,8 @@ where
         tx_last_bits: u8,
         with_anti_collision: bool,
         with_crc: bool,
-    ) -> Result<FifoData<RX>, Error<E, OPE>> {
-        println!("Communicate to picc {:x?}", tx_buffer);
+    ) -> Result<FifoData<RX>, Error<SPIM::SpiError, OPE>> {
+        // println!("Communicate to picc {:x?}", tx_buffer);
         self.setup_interrupt_mask(InterruptFlags::END_OF_RECEIVE)?;
 
         self.execute_command(Command::Clear)?;
@@ -325,8 +348,8 @@ where
             + (((tx_last_bits & 0x7) << 3) as usize)
             + (with_anti_collision as usize);
 
-        println!("full_bytes_num {full_bytes_num}");
-        println!("flags {flags}");
+        // println!("full_bytes_num {full_bytes_num}");
+        // println!("flags {flags}");
 
         self.write_register(Register::NumberOfTransmittedBytes0, flags as u8)?;
         self.write_register(
@@ -351,9 +374,9 @@ where
             self.execute_command(Command::TransmitWithoutCRC)?;
         }
 
-        let intr = self.wait_for_interrupt(250)?;
+        let intr = self.wait_for_interrupt(5)?;
 
-        println!("intr {:?}", intr);
+        // println!("intr {:?}", intr);
 
         if intr.contains(InterruptFlags::BIT_COLLISION) {
             return Err(Error::Collision);
@@ -375,14 +398,14 @@ where
         // })
     }
 
-    fn fifo_data<const RX: usize>(&mut self) -> Result<FifoData<RX>, Error<E, OPE>> {
+    fn fifo_data<const RX: usize>(&mut self) -> Result<FifoData<RX>, Error<SPIM::SpiError, OPE>> {
         let mut buffer = [0u8; RX];
         let mut valid_bytes: usize = 0;
         let mut valid_bits = 0;
 
         if RX > 0 {
             let fifo_status = self.read_register(Register::FIFOStatus)?;
-            println!("fifo_status {}", fifo_status);
+            // println!("fifo_status {}", fifo_status);
 
             valid_bytes = (fifo_status >> 2) as usize;
             if valid_bytes > RX {
@@ -403,74 +426,74 @@ where
         })
     }
 
-    pub fn setup_interrupt_mask(&mut self, flags: InterruptFlags) -> Result<u8, Error<E, OPE>> {
+    pub fn setup_interrupt_mask(&mut self, flags: InterruptFlags) -> Result<u8, Error<SPIM::SpiError, OPE>> {
         // Need to invert bits
         self.write_register(Register::MaskInterrupt, !flags.bits())?;
         // Clear interrupts
         self.read_register(Register::Interrupt)
     }
 
-    pub fn execute_command(&mut self, command: Command) -> Result<(), Error<E, OPE>> {
+    pub fn execute_command(&mut self, command: Command) -> Result<(), Error<SPIM::SpiError, OPE>> {
         self.write(&[command.command_pattern()])
     }
 
-    pub fn write_register(&mut self, reg: Register, val: u8) -> Result<(), Error<E, OPE>> {
+    pub fn write_register(&mut self, reg: Register, val: u8) -> Result<(), Error<SPIM::SpiError, OPE>> {
         self.write(&[reg.write_address(), val])
     }
 
-    pub fn read_register(&mut self, reg: Register) -> Result<u8, Error<E, OPE>> {
+    pub fn read_register(&mut self, reg: Register) -> Result<u8, Error<SPIM::SpiError, OPE>> {
         let mut buffer = [reg.read_address(), 0];
 
-        self.with_cs_high(|mfr| {
-            let buffer = mfr.spi.transfer(&mut buffer).map_err(Error::Spi)?;
+        self.spi_manager.with_cs_high(&mut self.cs,|spi| {
+            let buffer = spi.transfer(&mut buffer)?;
 
             Ok(buffer[1])
-        })
+        }).map_err(Error::SpiManager)
     }
 
-    fn read<'b>(&mut self, reg: Register, buffer: &'b mut [u8]) -> Result<&'b [u8], Error<E, OPE>> {
+    fn read<'b>(&mut self, reg: Register, buffer: &'b mut [u8]) -> Result<&'b [u8], Error<SPIM::SpiError, OPE>> {
         let byte = reg.read_address();
 
-        self.with_cs_high(move |mfr| {
-            mfr.spi.transfer(&mut [byte]).map_err(Error::Spi)?;
+        self.spi_manager.with_cs_high(&mut self.cs, move |spi| {
+            spi.transfer(&mut [byte])?;
 
             let n = buffer.len();
             for slot in &mut buffer[..n - 1] {
-                *slot = mfr.spi.transfer(&mut [byte]).map_err(Error::Spi)?[0];
+                *slot = spi.transfer(&mut [byte])?[0];
             }
 
-            buffer[n - 1] = mfr.spi.transfer(&mut [0]).map_err(Error::Spi)?[0];
+            buffer[n - 1] = spi.transfer(&mut [0])?[0];
 
             Ok(&*buffer)
-        })
+        }).map_err(Error::SpiManager)
     }
 
-    fn read_fifo<'b>(&mut self, buffer: &'b mut [u8]) -> Result<&'b [u8], Error<E, OPE>> {
-        self.with_cs_high(move |mfr| {
+    fn read_fifo<'b>(&mut self, buffer: &'b mut [u8]) -> Result<&'b [u8], Error<SPIM::SpiError, OPE>> {
+        self.spi_manager.with_cs_high(&mut self.cs, move |spi| {
             // initiate fifo read
-            mfr.spi.transfer(&mut [0b10111111]).map_err(Error::Spi)?;
+            spi.transfer(&mut [0b10111111])?;
 
             let n = buffer.len();
             for slot in &mut buffer[..n] {
-                *slot = mfr.spi.transfer(&mut [0]).map_err(Error::Spi)?[0];
+                *slot = spi.transfer(&mut [0])?[0];
             }
 
             Ok(&*buffer)
-        })
+        }).map_err(Error::SpiManager)
     }
 
-    fn write_fifo(&mut self, bytes: &[u8]) -> Result<(), Error<E, OPE>> {
-        self.with_cs_high(|mfr| {
+    fn write_fifo(&mut self, bytes: &[u8]) -> Result<(), Error<SPIM::SpiError, OPE>> {
+        self.spi_manager.with_cs_high(&mut self.cs,|spi| {
             // initiate fifo write
-            mfr.spi.transfer(&mut [0b10000000]).map_err(Error::Spi)?;
+            spi.transfer(&mut [0b10000000])?;
 
-            mfr.spi.write(bytes).map_err(Error::Spi)?;
+            spi.write(bytes)?;
 
             Ok(())
-        })
+        }).map_err(Error::SpiManager)
     }
 
-    fn wait_for_interrupt(&mut self, timeout_in_ms: u16) -> Result<InterruptFlags, Error<E, OPE>> {
+    fn wait_for_interrupt(&mut self, timeout_in_ms: u16) -> Result<InterruptFlags, Error<SPIM::SpiError, OPE>> {
         let mut i = 0;
         loop {
             if self.intr.is_high().map_err(Error::InterruptPin)? {
@@ -489,29 +512,19 @@ where
         Err(Error::InterruptTimeout)
     }
 
-    fn write(&mut self, bytes: &[u8]) -> Result<(), Error<E, OPE>> {
-        self.with_cs_high(|mfr| {
-            mfr.spi.write(bytes).map_err(Error::Spi)?;
+    fn write(&mut self, bytes: &[u8]) -> Result<(), Error<SPIM::SpiError, OPE>> {
+        self.spi_manager.with_cs_high(&mut self.cs, |spi| {
+            spi.write(bytes)?;
 
             Ok(())
-        })
+        }).map_err(Error::SpiManager)
     }
 
-    fn with_cs_high<F, T>(&mut self, f: F) -> Result<T, Error<E, OPE>>
-    where
-        F: FnOnce(&mut Self) -> Result<T, Error<E, OPE>>,
-    {
-        self.cs.set_high().map_err(Error::ChipSelect)?;
-        let result = f(self);
-        self.cs.set_low().map_err(Error::ChipSelect)?;
-
-        result
-    }
 }
 
 #[derive(Debug)]
 pub enum Error<E, OPE> {
-    Spi(E),
+    SpiManager(WithHighError<E, OPE>),
     ChipSelect(OPE),
     InterruptPin(OPE),
 
@@ -524,4 +537,5 @@ pub enum Error<E, OPE> {
     Proprietary,
     AntiCollisionMaxLoopsReached,
     IncompleteFrame,
+    NotAcknowledged,
 }
