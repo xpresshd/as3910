@@ -12,15 +12,31 @@ use hal::blocking::spi;
 use hal::digital::v2::InputPin;
 use hal::digital::v2::OutputPin;
 use register::InterruptFlags;
-use spi_manager::SpiManager;
-use spi_manager::WithHighError;
 
 pub mod command;
 mod picc;
 pub mod register;
-pub mod spi_manager;
 
 use crate::register::Register;
+
+#[derive(Debug)]
+pub enum WithHighError<E, OPE> {
+    SPI(E),
+    CS(OPE),
+}
+
+pub trait SpiWithCustomCS: spi::Transfer<u8, Error = Self::SpiError> + spi::Write<u8, Error = Self::SpiError> {
+    type SpiError;
+    
+    fn with_cs_high<F, T, CS, OPE>(
+        &mut self,
+        cs: &mut CS,
+        f: F,
+    ) -> Result<T, WithHighError<Self::SpiError, OPE>>
+    where
+        F: FnOnce(&mut Self) -> Result<T, Self::SpiError>,
+        CS: OutputPin<Error = OPE>;
+}
 
 /// Answer To reQuest A
 pub struct AtqA {
@@ -110,7 +126,7 @@ pub struct AS3910<SPIM, CS, INTR, DELAY> {
 
 impl<OPE, CS, INTR, SPIM, DELAY> AS3910<SPIM, CS, INTR, DELAY>
 where
-    SPIM: SpiManager,
+    SPIM: SpiWithCustomCS,
     CS: OutputPin<Error = OPE>,
     INTR: InputPin<Error = OPE>,
     DELAY: delay::DelayMs<u16>,
