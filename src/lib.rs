@@ -11,6 +11,8 @@ use hal::blocking::delay;
 use hal::blocking::spi;
 use hal::digital::v2::InputPin;
 use hal::digital::v2::OutputPin;
+use hal::prelude::_embedded_hal_blocking_spi_Transfer;
+use hal::prelude::_embedded_hal_blocking_spi_Write;
 use register::InterruptFlags;
 
 pub mod command;
@@ -25,7 +27,8 @@ pub enum WithHighError<E, OPE> {
     CS(OPE),
 }
 
-pub trait SpiWithCustomCS: spi::Transfer<u8, Error = Self::SpiError> + spi::Write<u8, Error = Self::SpiError> {
+pub trait SpiWithCustomCS {
+    type Spi: spi::Transfer<u8, Error = Self::SpiError> + spi::Write<u8, Error = Self::SpiError>;
     type SpiError;
     
     fn with_cs_high<F, T, CS, OPE>(
@@ -34,7 +37,7 @@ pub trait SpiWithCustomCS: spi::Transfer<u8, Error = Self::SpiError> + spi::Writ
         f: F,
     ) -> Result<T, WithHighError<Self::SpiError, OPE>>
     where
-        F: FnOnce(&mut Self) -> Result<T, Self::SpiError>,
+        F: FnOnce(&mut Self::Spi) -> Result<T, Self::SpiError>,
         CS: OutputPin<Error = OPE>;
 }
 
