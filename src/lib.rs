@@ -15,8 +15,8 @@ use hal::prelude::_embedded_hal_blocking_spi_Transfer;
 use hal::prelude::_embedded_hal_blocking_spi_Write;
 use register::InterruptFlags;
 
-pub mod command;
 mod picc;
+pub mod command;
 pub mod register;
 
 use crate::register::Register;
@@ -523,7 +523,6 @@ where
 #[derive(Debug)]
 pub enum Error<E, OPE> {
     SpiWithCS(SPIOrCSError<E, OPE>),
-    ChipSelect(OPE),
     InterruptPin(OPE),
 
     /// Set when Calibrate antenna sequence was not able to adjust resonance
