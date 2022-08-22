@@ -1,4 +1,4 @@
-// #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(not(feature = "std"), no_std)]
 
 #[macro_use]
 extern crate bitflags;
@@ -22,7 +22,7 @@ pub mod register;
 use crate::register::Register;
 
 #[derive(Debug)]
-pub enum WithHighError<E, OPE> {
+pub enum SPIOrCSError<E, OPE> {
     SPI(E),
     CS(OPE),
 }
@@ -35,7 +35,7 @@ pub trait SpiWithCustomCS {
         &mut self,
         cs: &mut CS,
         f: F,
-    ) -> Result<T, WithHighError<Self::SpiError, OPE>>
+    ) -> Result<T, SPIOrCSError<Self::SpiError, OPE>>
     where
         F: FnOnce(&mut Self::Spi) -> Result<T, Self::SpiError>,
         CS: OutputPin<Error = OPE>;
@@ -93,8 +93,6 @@ pub struct FifoData<const L: usize> {
     buffer: [u8; L],
     /// The number of valid bytes in the buffer
     valid_bytes: usize,
-    /// The number of valid bits in the last byte
-    valid_bits: usize,
 }
 
 impl<const L: usize> FifoData<L> {
@@ -115,29 +113,29 @@ impl<const L: usize> FifoData<L> {
         if len > 0 {
             dst[idx..idx + len].copy_from_slice(&self.buffer[1..=len]);
         }
-        dst_valid_bits + (len * 8) as u8 + self.valid_bits as u8
+        dst_valid_bits + (len * 8) as u8
     }
 }
 
-pub struct AS3910<SPIM, CS, INTR, DELAY> {
-    spi_manager: SPIM,
+pub struct AS3910<SPICS, CS, INTR, DELAY> {
+    spi_with_custom_cs: SPICS,
     cs: CS,
     /// Interrupt pin
     intr: INTR,
     delay: DELAY,
 }
 
-impl<OPE, CS, INTR, SPIM, DELAY> AS3910<SPIM, CS, INTR, DELAY>
+impl<OPE, CS, INTR, SPICS, DELAY> AS3910<SPICS, CS, INTR, DELAY>
 where
-    SPIM: SpiWithCustomCS,
+    SPICS: SpiWithCustomCS,
     CS: OutputPin<Error = OPE>,
     INTR: InputPin<Error = OPE>,
     DELAY: delay::DelayMs<u16>,
 {
 
-    pub fn new(spi_manager: SPIM, cs: CS, intr: INTR, delay: DELAY) -> Result<Self, Error<SPIM::SpiError, OPE>> {
+    pub fn new(spi_with_custom_cs: SPICS, cs: CS, intr: INTR, delay: DELAY) -> Result<Self, Error<SPICS::SpiError, OPE>> {
         let mut as3910 = Self {
-            spi_manager,
+            spi_with_custom_cs,
             cs,
             intr,
             delay,
@@ -168,12 +166,12 @@ where
         Ok(as3910)
     }
 
-    pub fn reset(&mut self) -> Result<(), Error<SPIM::SpiError, OPE>> {
+    pub fn reset(&mut self) -> Result<(), Error<SPICS::SpiError, OPE>> {
         self.execute_command(Command::SetDefault)
     }
 
     /// Sends a REQuest type A to nearby PICCs
-    pub fn reqa(&mut self) -> Result<Option<AtqA>, Error<SPIM::SpiError, OPE>> {
+    pub fn reqa(&mut self) -> Result<Option<AtqA>, Error<SPICS::SpiError, OPE>> {
         self.execute_command(Command::Clear)?;
         self.write_register(Register::ConfigurationRegister3, 0x80)?;
         self.setup_interrupt_mask(InterruptFlags::END_OF_RECEIVE)?;
@@ -195,7 +193,7 @@ where
     }
 
     /// Sends a Wake UP type A to nearby PICCs
-    pub fn wupa(&mut self) -> Result<Option<AtqA>, Error<SPIM::SpiError, OPE>> {
+    pub fn wupa(&mut self) -> Result<Option<AtqA>, Error<SPICS::SpiError, OPE>> {
         self.setup_interrupt_mask(InterruptFlags::END_OF_RECEIVE)?;
         self.execute_command(Command::TransmitWUPA)?;
 
@@ -215,7 +213,7 @@ where
     }
 
     /// Sends command to enter HALT state
-    pub fn hlta(&mut self) -> Result<(), Error<SPIM::SpiError, OPE>> {
+    pub fn hlta(&mut self) -> Result<(), Error<SPICS::SpiError, OPE>> {
         // The standard says:
         //   If the PICC responds with any modulation during a period of 1 ms
         //   after the end of the frame containing the HLTA command,
@@ -228,7 +226,7 @@ where
         }
     }
 
-    pub fn select(&mut self) -> Result<Uid, Error<SPIM::SpiError, OPE>> {
+    pub fn select(&mut self) -> Result<Uid, Error<SPICS::SpiError, OPE>> {
         let mut cascade_level: u8 = 0;
         let mut uid_bytes: [u8; 10] = [0u8; 10];
         let mut uid_idx: usize = 0;
@@ -350,7 +348,7 @@ where
         tx_last_bits: u8,
         with_anti_collision: bool,
         with_crc: bool,
-    ) -> Result<FifoData<RX>, Error<SPIM::SpiError, OPE>> {
+    ) -> Result<FifoData<RX>, Error<SPICS::SpiError, OPE>> {
         // println!("Communicate to picc {:x?}", tx_buffer);
         self.setup_interrupt_mask(InterruptFlags::END_OF_RECEIVE)?;
 
@@ -417,10 +415,9 @@ where
         // })
     }
 
-    fn fifo_data<const RX: usize>(&mut self) -> Result<FifoData<RX>, Error<SPIM::SpiError, OPE>> {
+    fn fifo_data<const RX: usize>(&mut self) -> Result<FifoData<RX>, Error<SPICS::SpiError, OPE>> {
         let mut buffer = [0u8; RX];
         let mut valid_bytes: usize = 0;
-        let mut valid_bits = 0;
 
         if RX > 0 {
             let fifo_status = self.read_register(Register::FIFOStatus)?;
@@ -441,54 +438,36 @@ where
         Ok(FifoData {
             buffer,
             valid_bytes,
-            valid_bits,
         })
     }
 
-    pub fn setup_interrupt_mask(&mut self, flags: InterruptFlags) -> Result<u8, Error<SPIM::SpiError, OPE>> {
+    pub fn setup_interrupt_mask(&mut self, flags: InterruptFlags) -> Result<u8, Error<SPICS::SpiError, OPE>> {
         // Need to invert bits
         self.write_register(Register::MaskInterrupt, !flags.bits())?;
         // Clear interrupts
         self.read_register(Register::Interrupt)
     }
 
-    pub fn execute_command(&mut self, command: Command) -> Result<(), Error<SPIM::SpiError, OPE>> {
+    pub fn execute_command(&mut self, command: Command) -> Result<(), Error<SPICS::SpiError, OPE>> {
         self.write(&[command.command_pattern()])
     }
 
-    pub fn write_register(&mut self, reg: Register, val: u8) -> Result<(), Error<SPIM::SpiError, OPE>> {
+    pub fn write_register(&mut self, reg: Register, val: u8) -> Result<(), Error<SPICS::SpiError, OPE>> {
         self.write(&[reg.write_address(), val])
     }
 
-    pub fn read_register(&mut self, reg: Register) -> Result<u8, Error<SPIM::SpiError, OPE>> {
+    pub fn read_register(&mut self, reg: Register) -> Result<u8, Error<SPICS::SpiError, OPE>> {
         let mut buffer = [reg.read_address(), 0];
 
-        self.spi_manager.with_cs_high(&mut self.cs,|spi| {
+        self.spi_with_custom_cs.with_cs_high(&mut self.cs,|spi| {
             let buffer = spi.transfer(&mut buffer)?;
 
             Ok(buffer[1])
-        }).map_err(Error::SpiManager)
+        }).map_err(Error::SpiWithCS)
     }
 
-    fn read<'b>(&mut self, reg: Register, buffer: &'b mut [u8]) -> Result<&'b [u8], Error<SPIM::SpiError, OPE>> {
-        let byte = reg.read_address();
-
-        self.spi_manager.with_cs_high(&mut self.cs, move |spi| {
-            spi.transfer(&mut [byte])?;
-
-            let n = buffer.len();
-            for slot in &mut buffer[..n - 1] {
-                *slot = spi.transfer(&mut [byte])?[0];
-            }
-
-            buffer[n - 1] = spi.transfer(&mut [0])?[0];
-
-            Ok(&*buffer)
-        }).map_err(Error::SpiManager)
-    }
-
-    fn read_fifo<'b>(&mut self, buffer: &'b mut [u8]) -> Result<&'b [u8], Error<SPIM::SpiError, OPE>> {
-        self.spi_manager.with_cs_high(&mut self.cs, move |spi| {
+    fn read_fifo<'b>(&mut self, buffer: &'b mut [u8]) -> Result<&'b [u8], Error<SPICS::SpiError, OPE>> {
+        self.spi_with_custom_cs.with_cs_high(&mut self.cs, move |spi| {
             // initiate fifo read
             spi.transfer(&mut [0b10111111])?;
 
@@ -498,21 +477,21 @@ where
             }
 
             Ok(&*buffer)
-        }).map_err(Error::SpiManager)
+        }).map_err(Error::SpiWithCS)
     }
 
-    fn write_fifo(&mut self, bytes: &[u8]) -> Result<(), Error<SPIM::SpiError, OPE>> {
-        self.spi_manager.with_cs_high(&mut self.cs,|spi| {
+    fn write_fifo(&mut self, bytes: &[u8]) -> Result<(), Error<SPICS::SpiError, OPE>> {
+        self.spi_with_custom_cs.with_cs_high(&mut self.cs,|spi| {
             // initiate fifo write
             spi.transfer(&mut [0b10000000])?;
 
             spi.write(bytes)?;
 
             Ok(())
-        }).map_err(Error::SpiManager)
+        }).map_err(Error::SpiWithCS)
     }
 
-    fn wait_for_interrupt(&mut self, timeout_in_ms: u16) -> Result<InterruptFlags, Error<SPIM::SpiError, OPE>> {
+    fn wait_for_interrupt(&mut self, timeout_in_ms: u16) -> Result<InterruptFlags, Error<SPICS::SpiError, OPE>> {
         let mut i = 0;
         loop {
             if self.intr.is_high().map_err(Error::InterruptPin)? {
@@ -531,19 +510,19 @@ where
         Err(Error::InterruptTimeout)
     }
 
-    fn write(&mut self, bytes: &[u8]) -> Result<(), Error<SPIM::SpiError, OPE>> {
-        self.spi_manager.with_cs_high(&mut self.cs, |spi| {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), Error<SPICS::SpiError, OPE>> {
+        self.spi_with_custom_cs.with_cs_high(&mut self.cs, |spi| {
             spi.write(bytes)?;
 
             Ok(())
-        }).map_err(Error::SpiManager)
+        }).map_err(Error::SpiWithCS)
     }
 
 }
 
 #[derive(Debug)]
 pub enum Error<E, OPE> {
-    SpiManager(WithHighError<E, OPE>),
+    SpiWithCS(SPIOrCSError<E, OPE>),
     ChipSelect(OPE),
     InterruptPin(OPE),
 
